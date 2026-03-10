@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+.streamlit/secrets.toml
+.venv/
+
+plot_*.py
+*.png
+
+validation_data/*
+!validation_data/.gitkeep
+
+validation_plots/*
+!validation_plots/.gitkeep
