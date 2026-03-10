@@ -18,6 +18,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 
+st.set_page_config(layout="wide")
+
+
 @dataclass
 class Instrument:
     instr_id: str
@@ -487,22 +490,23 @@ def fetch_snapshot_offsets(root: Path, instruments: list[Instrument], snapshot_d
                 return {}
 
             union_query = build_synthetic_data_union_query(table_names)
-            instr_clause, instr_params = build_in_clause("instr_id", instrument_ids)
+            latest_instr_clause, instr_params = build_in_clause("latest_source.instr_id", instrument_ids)
+            combined_instr_clause, combined_instr_params = build_in_clause("combined.instr_id", instrument_ids)
             query = f"""
             SELECT combined.instr_id, combined.date1, combined.data1, combined.custom_fields
             FROM ({union_query}) combined
             JOIN (
                 SELECT instr_id, MAX(date1) AS max_date1
                 FROM ({union_query}) latest_source
-                WHERE {instr_clause} AND date1 <= %s
+                WHERE {latest_instr_clause} AND date1 <= %s
                 GROUP BY instr_id
             ) latest
               ON combined.instr_id = latest.instr_id
              AND combined.date1 = latest.max_date1
-            WHERE {instr_clause} AND combined.date1 <= %s
+            WHERE {combined_instr_clause} AND combined.date1 <= %s
             ORDER BY combined.instr_id, combined.date1 DESC
             """
-            params = (*instr_params, snapshot_cutoff, *instr_params, snapshot_cutoff)
+            params = (*instr_params, snapshot_cutoff, *combined_instr_params, snapshot_cutoff)
             cursor.execute(query, params)
             rows = cursor.fetchall() or []
 
@@ -656,6 +660,13 @@ def write_timeseries_batch(target_cursor, table_name: str, rows: list[tuple[str,
     target_cursor.executemany(insert_sql, rows)
 
 
+def quote_sql_identifier(identifier: str) -> str:
+    parts = [part.strip() for part in str(identifier).split(".") if part.strip()]
+    if not parts:
+        raise ValueError("SQL identifier cannot be empty")
+    return ".".join(f"`{part}`" for part in parts)
+
+
 def build_exact_match_filter_clause(
     column_names: tuple[str, ...],
     values: list[tuple[Any, ...]],
@@ -666,7 +677,7 @@ def build_exact_match_filter_clause(
     row_clauses: list[str] = []
     params: list[Any] = []
     for row_values in values:
-        row_clause = " AND ".join(f"`{column_name}` = %s" for column_name in column_names)
+        row_clause = " AND ".join(f"{quote_sql_identifier(column_name)} = %s" for column_name in column_names)
         row_clauses.append(f"({row_clause})")
         params.extend(row_values)
 
@@ -675,7 +686,7 @@ def build_exact_match_filter_clause(
 
 def build_in_clause(column_name: str, values: list[Any]) -> tuple[str, tuple[Any, ...]]:
     placeholders = ", ".join(["%s"] * len(values))
-    return f"`{column_name}` IN ({placeholders})", tuple(values)
+    return f"{quote_sql_identifier(column_name)} IN ({placeholders})", tuple(values)
 
 
 def fetch_source_rows(
@@ -877,7 +888,7 @@ def write_table_rows_to_target(
         append_stream_log(root, f"Skipped table {table_name}: no matching filtered rows in source.", runtime=runtime)
         return True
 
-    column_sql = ", ".join(f"`{column}`" for column in columns)
+    column_sql = ", ".join(quote_sql_identifier(column) for column in columns)
     placeholders = ", ".join(["%s"] * len(columns))
     insert_sql = f"INSERT INTO `{table_name}` ({column_sql}) VALUES ({placeholders})"
 
@@ -1322,7 +1333,7 @@ def create_validation_plot(converted_rows: list[dict], root: Path) -> Path | Non
 
     figure.update_layout(
         mapbox_style="carto-darkmatter",
-        mapbox_zoom=12,
+        mapbox_zoom=15,
         mapbox_center={"lat": mean_lat, "lon": mean_lon},
         margin={"l": 0, "r": 0, "t": 40, "b": 0},
         title="Instrument locations by type",
@@ -2404,7 +2415,7 @@ def save_event_spatial_plot(
     center_lon = sum(event.epicentre.longitude for event in events) / len(events) if events else 105.8
     figure.update_layout(
         mapbox_style="carto-darkmatter",
-        mapbox_zoom=12,
+        mapbox_zoom=15,
         mapbox_center={"lat": center_lat, "lon": center_lon},
         mapbox_layers=layers,
         title="Event spatial distribution",
@@ -2748,7 +2759,7 @@ def save_scalar_timeslice_map_plot(
     center_lon = sum(longitudes) / len(longitudes) if longitudes else 105.8
     figure.update_layout(
         mapbox_style="carto-darkmatter",
-        mapbox_zoom=12,
+        mapbox_zoom=15,
         mapbox_center={"lat": center_lat, "lon": center_lon},
         mapbox_layers=layers,
         margin={"l": 0, "r": 0, "t": 40, "b": 0},
@@ -2860,7 +2871,7 @@ def save_subsurface_timeslice_vector_map_plot(
     center_lon = sum(longitudes) / len(longitudes) if longitudes else 105.8
     figure.update_layout(
         mapbox_style="carto-darkmatter",
-        mapbox_zoom=12,
+        mapbox_zoom=15,
         mapbox_center={"lat": center_lat, "lon": center_lon},
         mapbox_layers=layers,
         margin={"l": 0, "r": 0, "t": 40, "b": 0},
@@ -3256,58 +3267,61 @@ with st.form("extract_form"):
     if instrument_plot_path:
         render_html_plot(Path(instrument_plot_path))
 
+# Keep interdependent controls out of st.form so Streamlit can rerun immediately
+# when users toggle the start mode or Today checkbox.
+if not snapshot_available:
+    st.session_state["time_series_start_mode"] = TIME_SERIES_START_MODE_ZERO
+
+start_mode_options = [TIME_SERIES_START_MODE_ZERO, TIME_SERIES_START_MODE_SNAPSHOT]
+
+current_start_mode = st.session_state.get("time_series_start_mode", TIME_SERIES_START_MODE_ZERO)
+if current_start_mode not in start_mode_options or (not snapshot_available and current_start_mode == TIME_SERIES_START_MODE_SNAPSHOT):
+    current_start_mode = TIME_SERIES_START_MODE_ZERO
+
+start_mode = st.radio(
+    "Time series start from:",
+    options=start_mode_options,
+    index=start_mode_options.index(current_start_mode),
+    key="time_series_start_mode",
+    disabled=not snapshot_available,
+)
+if snapshot_bounds_error:
+    st.caption(f"Snapshot start is unavailable because the target database could not be queried: {snapshot_bounds_error}")
+elif not snapshot_available:
+    st.caption("Snapshot of existing synthetic data is unavailable because mydata and futuredata do not contain any rows.")
+
+if start_mode == TIME_SERIES_START_MODE_SNAPSHOT and snapshot_available:
+    snapshot_default_date = st.session_state.get("snapshot_start_date", snapshot_min_date)
+    if not isinstance(snapshot_default_date, date):
+        snapshot_default_date = snapshot_min_date
+    snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_max_date)
+    start_date = st.date_input(
+        "Start date",
+        value=snapshot_default_date,
+        min_value=snapshot_min_date,
+        max_value=snapshot_max_date,
+        key="snapshot_start_date",
+    )
+else:
+    zero_default_date = st.session_state.get("zero_start_date", default_start_date)
+    if not isinstance(zero_default_date, date):
+        zero_default_date = default_start_date
+    start_date = st.date_input(
+        "Start date",
+        value=zero_default_date,
+        key="zero_start_date",
+    )
+st.markdown("End date")
+use_today = st.checkbox("Today", value=True, key="use_today")
+end_date = st.date_input(
+    "End date",
+    value=st.session_state.get("selected_end_date", date.today()),
+    disabled=use_today,
+    label_visibility="collapsed",
+    key="selected_end_date",
+)
 with st.form("generate_event_history_form"):
     st.subheader("Generate event history")
-    if not snapshot_available:
-        st.session_state["time_series_start_mode"] = TIME_SERIES_START_MODE_ZERO
-
-    start_mode_options = [TIME_SERIES_START_MODE_ZERO, TIME_SERIES_START_MODE_SNAPSHOT]
-
-    current_start_mode = st.session_state.get("time_series_start_mode", TIME_SERIES_START_MODE_ZERO)
-    if current_start_mode not in start_mode_options or (not snapshot_available and current_start_mode == TIME_SERIES_START_MODE_SNAPSHOT):
-        current_start_mode = TIME_SERIES_START_MODE_ZERO
-
-    start_mode = st.radio(
-        "Time series start from:",
-        options=start_mode_options,
-        index=start_mode_options.index(current_start_mode),
-        key="time_series_start_mode",
-        disabled=not snapshot_available,
-    )
-    if snapshot_bounds_error:
-        st.caption(f"Snapshot start is unavailable because the target database could not be queried: {snapshot_bounds_error}")
-    elif not snapshot_available:
-        st.caption("Snapshot of existing synthetic data is unavailable because mydata and futuredata do not contain any rows.")
-
-    if start_mode == TIME_SERIES_START_MODE_SNAPSHOT and snapshot_available:
-        snapshot_default_date = st.session_state.get("snapshot_start_date", snapshot_min_date)
-        if not isinstance(snapshot_default_date, date):
-            snapshot_default_date = snapshot_min_date
-        snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_max_date)
-        start_date = st.date_input(
-            "Start date",
-            value=snapshot_default_date,
-            min_value=snapshot_min_date,
-            max_value=snapshot_max_date,
-            key="snapshot_start_date",
-        )
-    else:
-        zero_default_date = st.session_state.get("zero_start_date", default_start_date)
-        if not isinstance(zero_default_date, date):
-            zero_default_date = default_start_date
-        start_date = st.date_input(
-            "Start date",
-            value=zero_default_date,
-            key="zero_start_date",
-        )
-    st.markdown("End date")
-    use_today = st.checkbox("Today", value=True)
-    end_date = st.date_input(
-        "End date",
-        value=date.today(),
-        disabled=use_today,
-        label_visibility="collapsed",
-    )
     generate_current_state = get_form_log_state_snapshot("generate_log_state")
     generate_progress_bar = st.progress(max(0.0, min(1.0, float(generate_current_state.get("percent_complete", 0.0) or 0.0) / 100.0)))
     generate_progress_caption = st.empty()
@@ -3844,8 +3858,9 @@ def render_write_to_database_form() -> None:
         render_write_status_logs(current_state)
 
         write_column, cancel_column = st.columns(2)
+        write_enabled = not runtime_thread_is_alive(runtime)
         with write_column:
-            write_clicked = st.form_submit_button("Write")
+            write_clicked = st.form_submit_button("Write", disabled=not write_enabled)
         with cancel_column:
             # Keep cancel enabled until the worker thread is fully terminated.
             cancel_enabled = runtime_thread_is_alive(runtime)
@@ -3855,6 +3870,7 @@ def render_write_to_database_form() -> None:
             append_stream_log(root, "Cancel button clicked by user.", runtime=runtime)
             request_cancel(root, runtime)
             st.warning("Cancellation requested. No further SQL write statements will be executed.")
+            st.rerun()
 
         if write_clicked:
             runtime = get_db_write_runtime()
@@ -3928,15 +3944,20 @@ def render_write_to_database_form() -> None:
                     runtime["thread"] = worker
                     worker.start()
                     st.success("Write process started in background.")
+                    st.rerun()
 
 
-if hasattr(st, "fragment"):
+if hasattr(st, "fragment") and str(get_db_write_state().get("status")) in {"running", "cancelling"}:
     @st.fragment(run_every="1s")
     def write_form_fragment() -> None:
         render_write_to_database_form()
 
+        current_state = get_db_write_state()
+        if str(current_state.get("status")) not in {"running", "cancelling"} and not bool(current_state.get("thread_alive")):
+            st.rerun()
+
     write_form_fragment()
 else:
     render_write_to_database_form()
-    if str(get_db_write_state().get("status")) in {"running", "cancelling"}:
+    if not hasattr(st, "fragment") and str(get_db_write_state().get("status")) in {"running", "cancelling"}:
         st.info("Automatic refresh is unavailable in this Streamlit version. Interact with the page to refresh status.")

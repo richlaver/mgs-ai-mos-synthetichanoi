@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from pathlib import Path
+import os
 import sys
 import tomllib
 
 import pymysql
+
+
+ENV_VAR_NAMES = {
+    "db_host": "HANOI_SYNTHETIC_DB_HOST",
+    "db_user": "HANOI_SYNTHETIC_DB_USER",
+    "db_pass": "HANOI_SYNTHETIC_DB_PASS",
+    "db_name": "HANOI_SYNTHETIC_DB_NAME",
+    "port": "HANOI_SYNTHETIC_DB_PORT",
+}
 
 
 ROW_MATCH_CONDITION = " AND ".join(
@@ -31,10 +41,43 @@ def append_stream_log(root: Path, message: str) -> None:
     print(line, flush=True)
 
 
-def read_target_db_config(root: Path) -> dict[str, object]:
+def read_target_db_config_from_env() -> dict[str, object] | None:
+    values = {key: os.getenv(env_var, "").strip() for key, env_var in ENV_VAR_NAMES.items()}
+    required_keys = ("db_host", "db_user", "db_pass", "db_name")
+    present_required_keys = [key for key in required_keys if values[key]]
+
+    if not present_required_keys:
+        return None
+
+    missing_required_env_vars = [ENV_VAR_NAMES[key] for key in required_keys if not values[key]]
+    if missing_required_env_vars:
+        raise RuntimeError(
+            "Incomplete database configuration in environment variables. Missing: "
+            + ", ".join(missing_required_env_vars)
+        )
+
+    config: dict[str, object] = {
+        "db_host": values["db_host"],
+        "db_user": values["db_user"],
+        "db_pass": values["db_pass"],
+        "db_name": values["db_name"],
+    }
+    if values["port"]:
+        config["port"] = int(values["port"])
+    return config
+
+
+def read_target_db_config_from_secrets(root: Path) -> dict[str, object]:
     with (root / ".streamlit" / "secrets.toml").open("rb") as file:
         project_data = tomllib.load(file)["project_data"]
     return dict(project_data["hanoi_synthetic"])
+
+
+def read_target_db_config(root: Path) -> dict[str, object]:
+    env_config = read_target_db_config_from_env()
+    if env_config is not None:
+        return env_config
+    return read_target_db_config_from_secrets(root)
 
 
 def connect_mysql(config: dict[str, object]) -> pymysql.connections.Connection:
