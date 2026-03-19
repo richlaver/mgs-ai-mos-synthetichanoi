@@ -103,7 +103,7 @@ EVENT_DISTRIBUTION_PARAMS = {
         "magnitude_negative": {"alpha": 1.0, "beta": 2.0, "maximum": 20.0},
         "magnitude_positive": {"alpha": 1.0, "beta": 2.0, "maximum": 5.0},
         "duration_days": {"alpha": 0.5, "beta": 1.0, "maximum": 7.0},
-        "radius_m": {"alpha": 0.5, "beta": 1.0, "maximum": 100.0},
+        "radius_m": {"alpha": 2.0, "beta": 3.5, "maximum": 150.0},
     },
     "groundwater_level": {
         "magnitude_positive": {"alpha": 1.0, "beta": 2.0, "maximum": 2500.0},
@@ -119,7 +119,7 @@ EVENT_DISTRIBUTION_PARAMS = {
 }
 
 NOISE_EVENT_PEAK_PARAMS = {
-    "surface_settlement": {"mean": 0.0, "stddev": 1.0},
+    "surface_settlement": {"mean": 0.0, "stddev": 0.5},
     "groundwater_level": {"mean": 0.0, "stddev": 100.0},
     "subsurface_lateral_displacement": {"mean": 0.0, "stddev": 1.0},
 }
