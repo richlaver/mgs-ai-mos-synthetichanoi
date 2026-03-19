@@ -136,6 +136,7 @@ NOISE_EVENT_TIME_WINDOW_DAYS = 2
 # Clear child tables before parent tables to satisfy FK delete constraints.
 SUPPORTING_TABLES_CLEAR_ORDER = [
     "review_instruments_values",
+    "aaa_color_info",
     "review_instruments",
     "hierarchy_members",
     "instr_cal_calibs",
@@ -154,6 +155,7 @@ SUPPORTING_TABLES_COPY_ORDER = [
     "hierarchy_members",
     "review_instruments",
     "review_instruments_values",
+    "aaa_color_info",
     "instr_cal_calibs",
 ]
 
@@ -327,6 +329,15 @@ def render_form_progress_widgets(progress_bar, progress_caption, current_state: 
         progress_caption.caption("Progress will appear when the process starts.")
 
 
+def form_status_badge_color(status: str) -> str:
+    return {
+        "idle": "gray",
+        "running": "blue",
+        "completed": "green",
+        "error": "red",
+    }.get(status, "gray")
+
+
 def render_form_status_logs(title: str, current_state: dict[str, Any]) -> None:
     state = str(current_state.get("status", "idle"))
     status_state = "running"
@@ -336,12 +347,7 @@ def render_form_status_logs(title: str, current_state: dict[str, Any]) -> None:
         status_state = "error"
 
     st.caption(title)
-    st.badge(state.replace("_", " ").title(), color={
-        "idle": "gray",
-        "running": "blue",
-        "completed": "green",
-        "error": "red",
-    }.get(state, "gray"))
+    st.badge(state.replace("_", " ").title(), color=form_status_badge_color(state))
     if current_state.get("message"):
         st.caption(str(current_state.get("message")))
 
@@ -863,6 +869,13 @@ def build_supporting_table_copy_plan(source_cursor) -> dict[str, dict[str, Any]]
         )
     else:
         copy_plan["review_instruments_values"] = {"columns": [], "rows": []}
+
+    add_table_copy_plan_entry(
+        copy_plan,
+        source_cursor,
+        "aaa_color_info",
+        order_by="`id`",
+    )
 
     return copy_plan
 
@@ -3027,10 +3040,14 @@ def next_greater_child_depth(children: list[tuple[str, float]], depth_m: float) 
     return None
 
 
-def build_assimilation_dataframe(instruments: list[Instrument]) -> pd.DataFrame:
+def build_assimilation_dataframe(
+    instruments: list[Instrument],
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
+    total_instruments = len(instruments)
 
-    for instrument in instruments:
+    for instrument_index, instrument in enumerate(instruments, start=1):
         db_type = instrument.db_type
         if db_type in {"LP", "TLP", "CASA", "PZ"}:
             for point in instrument.timeseries:
@@ -3158,6 +3175,13 @@ def build_assimilation_dataframe(instruments: list[Instrument]) -> pd.DataFrame:
                     }
                 )
 
+        if progress_callback is not None:
+            progress_callback(
+                instrument_index,
+                total_instruments,
+                f"Assimilated {instrument_index} of {total_instruments} instruments into mydata rows.",
+            )
+
     return pd.DataFrame(rows, columns=["instr_id", "date1", "data1", "custom_fields"])
 
 
@@ -3179,9 +3203,13 @@ def load_or_synthesise_valid_instruments(
     end_date: date,
     events: list[Event],
     start_mode: str = TIME_SERIES_START_MODE_ZERO,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[list[Instrument], list[Event]]:
     in_memory_instruments = st.session_state.get("instruments", [])
     instruments: list[Instrument] = in_memory_instruments if has_valid_timeseries(in_memory_instruments) else []
+
+    if progress_callback is not None:
+        progress_callback(0.05, "Checking for existing valid time-series data.")
 
     if not instruments:
         from_json = load_instruments_from_json(root)
@@ -3189,20 +3217,43 @@ def load_or_synthesise_valid_instruments(
             instruments = from_json
 
     if instruments:
+        if progress_callback is not None:
+            progress_callback(1.0, f"Using {len(instruments)} instruments with existing valid time-series data.")
         return instruments, events
 
     instruments = load_instruments_from_json(root)
     if not instruments:
         instruments, _, _ = extract_instruments(root)
         instruments = load_instruments_from_json(root)
+    if progress_callback is not None:
+        progress_callback(0.2, f"Loaded {len(instruments)} instruments for assimilation.")
 
     if not events:
         events = load_events_from_json(root)
+    if events and progress_callback is not None:
+        progress_callback(0.35, f"Loaded {len(events)} events for assimilation.")
 
     if not events:
         transformer = get_db_transformer(root)
-        events = generate_events(instruments, start_date, end_date, transformer)
+        if progress_callback is not None:
+            progress_callback(0.3, "Generating event history required for assimilation.")
+        events = generate_events(
+            instruments,
+            start_date,
+            end_date,
+            transformer,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else lambda day_index, total_days, message: progress_callback(
+                    0.3 + (0.2 * (day_index / total_days if total_days else 1.0)),
+                    message,
+                )
+            ),
+        )
         save_events_to_json(root, events)
+        if progress_callback is not None:
+            progress_callback(0.5, f"Generated and saved {len(events)} events for assimilation.")
 
     baseline_offsets: dict[str, float] = {}
     if start_mode == TIME_SERIES_START_MODE_SNAPSHOT:
@@ -3210,6 +3261,15 @@ def load_or_synthesise_valid_instruments(
             baseline_offsets = fetch_snapshot_offsets(root, instruments, start_date)
         except Exception:
             baseline_offsets = {}
+    if progress_callback is not None:
+        progress_callback(
+            0.55,
+            (
+                f"Prepared {len(baseline_offsets)} snapshot offsets for assimilation."
+                if start_mode == TIME_SERIES_START_MODE_SNAPSHOT
+                else "Prepared zero-baseline mode for assimilation."
+            ),
+        )
 
     synthesise_timeseries_for_instruments(
         instruments,
@@ -3218,8 +3278,18 @@ def load_or_synthesise_valid_instruments(
         end_date,
         baseline_offsets=baseline_offsets,
         include_start_on_sunday=(start_mode == TIME_SERIES_START_MODE_ZERO),
+        progress_callback=(
+            None
+            if progress_callback is None
+            else lambda instrument_index, total_instruments, message: progress_callback(
+                0.55 + (0.35 * (instrument_index / total_instruments if total_instruments else 1.0)),
+                message,
+            )
+        ),
     )
     save_instruments_to_json(root, instruments)
+    if progress_callback is not None:
+        progress_callback(1.0, f"Saved {len(instruments)} instruments with valid time-series data.")
 
     return instruments, events
 
@@ -3248,6 +3318,8 @@ if "generate_log_state" not in st.session_state:
     st.session_state["generate_log_state"] = create_form_log_state()
 if "synthesise_log_state" not in st.session_state:
     st.session_state["synthesise_log_state"] = create_form_log_state()
+if "assimilate_log_state" not in st.session_state:
+    st.session_state["assimilate_log_state"] = create_form_log_state()
 
 root = Path(__file__).resolve().parent
 snapshot_min_date, snapshot_max_date, snapshot_bounds_error = fetch_synthetic_data_date_bounds(root)
@@ -3791,6 +3863,16 @@ with st.form("synthesise_time_series_form"):
 
 with st.form("assimilate_database_fields_form"):
     st.subheader("Assimilate database fields")
+    assimilate_current_state = get_form_log_state_snapshot("assimilate_log_state")
+    st.badge(
+        str(assimilate_current_state.get("status", "idle")).replace("_", " ").title(),
+        color=form_status_badge_color(str(assimilate_current_state.get("status", "idle"))),
+    )
+    assimilate_progress_bar = st.progress(
+        max(0.0, min(1.0, float(assimilate_current_state.get("percent_complete", 0.0) or 0.0) / 100.0))
+    )
+    assimilate_progress_caption = st.empty()
+    render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, assimilate_current_state)
     assimilate_clicked = st.form_submit_button("Assimilate")
 
     if assimilate_clicked:
@@ -3799,23 +3881,98 @@ with st.form("assimilate_database_fields_form"):
         events: list[Event] = st.session_state.get("events", [])
         final_end_date = date.today() if use_today else end_date
 
-        instruments, events = load_or_synthesise_valid_instruments(
-            root,
-            active_start_date,
-            final_end_date,
-            events,
-            start_mode=active_start_mode,
+        current_state = set_form_progress(
+            "assimilate_log_state",
+            0,
+            100,
+            status="running",
+            message="Preparing valid instrument time series for assimilation.",
         )
-        st.session_state["instruments"] = instruments
-        st.session_state["events"] = events
+        render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
 
-        mydata_df = build_assimilation_dataframe(instruments)
-        output_path = save_mydata_json(root, mydata_df)
+        try:
+            instruments, events = load_or_synthesise_valid_instruments(
+                root,
+                active_start_date,
+                final_end_date,
+                events,
+                start_mode=active_start_mode,
+                progress_callback=lambda fraction_complete, message: render_form_progress_widgets(
+                    assimilate_progress_bar,
+                    assimilate_progress_caption,
+                    set_form_progress(
+                        "assimilate_log_state",
+                        int(max(0.0, min(1.0, fraction_complete)) * 35),
+                        100,
+                        message=message,
+                    ),
+                ),
+            )
+            st.session_state["instruments"] = instruments
+            st.session_state["events"] = events
 
-        st.session_state["assimilated_preview"] = mydata_df.head(200).to_dict(orient="records")
-        st.session_state["assimilated_total_rows"] = int(len(mydata_df))
-        st.session_state["assimilated_output_path"] = str(output_path)
-        st.session_state["mydata_df_records"] = mydata_df.to_dict(orient="records")
+            current_state = set_form_progress(
+                "assimilate_log_state",
+                35,
+                100,
+                message=f"Building assimilation dataframe from {len(instruments)} instruments.",
+            )
+            render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
+
+            mydata_df = build_assimilation_dataframe(
+                instruments,
+                progress_callback=lambda instrument_index, total_instruments, message: render_form_progress_widgets(
+                    assimilate_progress_bar,
+                    assimilate_progress_caption,
+                    set_form_progress(
+                        "assimilate_log_state",
+                        35 + int((instrument_index / total_instruments if total_instruments else 1.0) * 55),
+                        100,
+                        message=message,
+                    ),
+                ),
+            )
+
+            current_state = set_form_progress(
+                "assimilate_log_state",
+                92,
+                100,
+                message=f"Saving {len(mydata_df)} assimilated rows to validation_data/mydata.json.",
+            )
+            render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
+            output_path = save_mydata_json(root, mydata_df)
+
+            current_state = set_form_progress(
+                "assimilate_log_state",
+                97,
+                100,
+                message="Updating in-memory assimilation preview and session data.",
+            )
+            render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
+
+            st.session_state["assimilated_preview"] = mydata_df.head(200).to_dict(orient="records")
+            st.session_state["assimilated_total_rows"] = int(len(mydata_df))
+            st.session_state["assimilated_output_path"] = str(output_path)
+            st.session_state["mydata_df_records"] = mydata_df.to_dict(orient="records")
+
+            current_state = set_form_progress(
+                "assimilate_log_state",
+                100,
+                100,
+                status="completed",
+                message=f"Assimilation completed with {len(mydata_df)} rows.",
+            )
+            render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
+        except Exception as error:
+            current_state = set_form_progress(
+                "assimilate_log_state",
+                int(get_form_log_state_snapshot("assimilate_log_state").get("completed_units", 0) or 0),
+                100,
+                status="error",
+                message=f"Assimilation failed: {error}",
+            )
+            render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, current_state)
+            st.error(f"Assimilation failed: {error}")
 
     preview_records = st.session_state.get("assimilated_preview", [])
     preview_df = pd.DataFrame(preview_records, columns=["instr_id", "date1", "data1", "custom_fields"])
@@ -3823,128 +3980,127 @@ with st.form("assimilate_database_fields_form"):
     st.caption(f"Total rows generated: {st.session_state.get('assimilated_total_rows', 0)}")
 
 def render_write_to_database_form() -> None:
-    with st.form("write_to_database_form"):
-        runtime = get_db_write_runtime()
-        st.subheader("Write to database")
+    runtime = get_db_write_runtime()
+    st.subheader("Write to database")
 
+    current_state = get_db_write_state()
+
+    # Ensure UI reflects actual thread liveness even during teardown transitions.
+    live_thread = runtime_thread_is_alive(runtime)
+    if live_thread != bool(current_state.get("thread_alive")):
+        update_db_write_state(runtime=runtime, thread_alive=live_thread)
         current_state = get_db_write_state()
 
-        # Ensure UI reflects actual thread liveness even during teardown transitions.
-        live_thread = runtime_thread_is_alive(runtime)
-        if live_thread != bool(current_state.get("thread_alive")):
-            update_db_write_state(runtime=runtime, thread_alive=live_thread)
-            current_state = get_db_write_state()
+    render_async_status_pill(str(current_state.get("async_status", "idle")))
 
-        render_async_status_pill(str(current_state.get("async_status", "idle")))
+    total_rows = int(current_state.get("total_rows", 0) or 0)
+    rows_written = int(current_state.get("rows_written", 0) or 0)
+    percent_complete = float(current_state.get("percent_complete", 0.0) or 0.0)
+    progress_value = max(0.0, min(1.0, percent_complete / 100.0))
+    st.progress(progress_value)
+    st.caption(f"Rows written: {rows_written} / {total_rows} ({percent_complete:.2f}%)")
+    if current_state.get("message"):
+        st.caption(str(current_state.get("message")))
 
-        total_rows = int(current_state.get("total_rows", 0) or 0)
-        rows_written = int(current_state.get("rows_written", 0) or 0)
-        percent_complete = float(current_state.get("percent_complete", 0.0) or 0.0)
-        progress_value = max(0.0, min(1.0, percent_complete / 100.0))
-        st.progress(progress_value)
-        st.caption(f"Rows written: {rows_written} / {total_rows} ({percent_complete:.2f}%)")
-        if current_state.get("message"):
-            st.caption(str(current_state.get("message")))
+    thread_alive = bool(current_state.get("thread_alive"))
+    st.badge("Thread Running" if thread_alive else "Thread Stopped", color=("green" if thread_alive else "gray"))
+    completed_at = str(current_state.get("thread_completed_at", "") or "")
+    terminal_message = str(current_state.get("thread_terminal_message", "") or "")
+    if completed_at:
+        st.caption(f"Thread completed at: {completed_at}")
+    if terminal_message:
+        st.caption(terminal_message)
 
-        thread_alive = bool(current_state.get("thread_alive"))
-        st.badge("Thread Running" if thread_alive else "Thread Stopped", color=("green" if thread_alive else "gray"))
-        completed_at = str(current_state.get("thread_completed_at", "") or "")
-        terminal_message = str(current_state.get("thread_terminal_message", "") or "")
-        if completed_at:
-            st.caption(f"Thread completed at: {completed_at}")
-        if terminal_message:
-            st.caption(terminal_message)
+    render_write_status_logs(current_state)
 
-        render_write_status_logs(current_state)
+    write_column, cancel_column = st.columns(2)
+    write_enabled = not runtime_thread_is_alive(runtime)
+    with write_column:
+        write_clicked = st.button("Write", disabled=not write_enabled, use_container_width=True)
+    with cancel_column:
+        # Keep cancel enabled until the worker thread is fully terminated.
+        cancel_enabled = runtime_thread_is_alive(runtime)
+        cancel_clicked = st.button("Cancel", disabled=not cancel_enabled, use_container_width=True)
 
-        write_column, cancel_column = st.columns(2)
-        write_enabled = not runtime_thread_is_alive(runtime)
-        with write_column:
-            write_clicked = st.form_submit_button("Write", disabled=not write_enabled)
-        with cancel_column:
-            # Keep cancel enabled until the worker thread is fully terminated.
-            cancel_enabled = runtime_thread_is_alive(runtime)
-            cancel_clicked = st.form_submit_button("Cancel", disabled=not cancel_enabled)
+    if cancel_clicked:
+        append_stream_log(root, "Cancel button clicked by user.", runtime=runtime)
+        request_cancel(root, runtime)
+        st.warning("Cancellation requested. No further SQL write statements will be executed.")
+        st.rerun()
 
-        if cancel_clicked:
-            append_stream_log(root, "Cancel button clicked by user.", runtime=runtime)
-            request_cancel(root, runtime)
-            st.warning("Cancellation requested. No further SQL write statements will be executed.")
-            st.rerun()
+    if write_clicked:
+        runtime = get_db_write_runtime()
+        existing_thread = runtime.get("thread")
+        append_stream_log(root, "Write button clicked by user.", runtime=runtime)
+        if isinstance(existing_thread, threading.Thread) and existing_thread.is_alive():
+            append_stream_log(root, "Write request rejected because a job is already running.", runtime=runtime)
+            st.warning("A write operation is already running.")
+        else:
+            active_start_mode = selected_start_mode()
+            active_start_date = selected_start_date(default_start_date)
+            final_end_date = date.today() if use_today else end_date
+            events_for_write: list[Event] = st.session_state.get("events", [])
 
-        if write_clicked:
-            runtime = get_db_write_runtime()
-            existing_thread = runtime.get("thread")
-            append_stream_log(root, "Write button clicked by user.", runtime=runtime)
-            if isinstance(existing_thread, threading.Thread) and existing_thread.is_alive():
-                append_stream_log(root, "Write request rejected because a job is already running.", runtime=runtime)
-                st.warning("A write operation is already running.")
-            else:
-                active_start_mode = selected_start_mode()
-                active_start_date = selected_start_date(default_start_date)
-                final_end_date = date.today() if use_today else end_date
-                events_for_write: list[Event] = st.session_state.get("events", [])
+            append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
+            dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
+                root,
+                active_start_date,
+                final_end_date,
+                events_for_write,
+                start_mode=active_start_mode,
+                runtime=runtime,
+            )
 
-                append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
-                dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
-                    root,
-                    active_start_date,
-                    final_end_date,
-                    events_for_write,
-                    start_mode=active_start_mode,
+            if was_reassimilated and rebuilt_instruments:
+                st.session_state["instruments"] = rebuilt_instruments
+            if rebuilt_events:
+                st.session_state["events"] = rebuilt_events
+
+            if dataframe.empty:
+                append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
+                update_db_write_state(
                     runtime=runtime,
+                    status="error",
+                    async_status="error",
+                    rows_written=0,
+                    total_rows=0,
+                    percent_complete=0.0,
+                    message=source_message,
+                    started=True,
                 )
+                st.error(source_message)
+            else:
+                runtime["cancel_event"].clear()
+                update_db_write_state(
+                    runtime=runtime,
+                    status="running",
+                    async_status="starting",
+                    rows_written=0,
+                    total_rows=int(len(dataframe)),
+                    percent_complete=0.0,
+                    message=source_message,
+                    started=True,
+                    thread_alive=True,
+                    thread_completed_at="",
+                    thread_terminal_message="",
+                )
+                append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
 
-                if was_reassimilated and rebuilt_instruments:
-                    st.session_state["instruments"] = rebuilt_instruments
-                if rebuilt_events:
-                    st.session_state["events"] = rebuilt_events
-
-                if dataframe.empty:
-                    append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
-                    update_db_write_state(
-                        runtime=runtime,
-                        status="error",
-                        async_status="error",
-                        rows_written=0,
-                        total_rows=0,
-                        percent_complete=0.0,
-                        message=source_message,
-                        started=True,
-                    )
-                    st.error(source_message)
-                else:
-                    runtime["cancel_event"].clear()
-                    update_db_write_state(
-                        runtime=runtime,
-                        status="running",
-                        async_status="starting",
-                        rows_written=0,
-                        total_rows=int(len(dataframe)),
-                        percent_complete=0.0,
-                        message=source_message,
-                        started=True,
-                        thread_alive=True,
-                        thread_completed_at="",
-                        thread_terminal_message="",
-                    )
-                    append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
-
-                    normalized_records = dataframe.to_dict(orient="records")
-                    worker = threading.Thread(
-                        target=run_database_write_job,
-                        args=(
-                            root,
-                            normalized_records,
-                            runtime,
-                            active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
-                        ),
-                        daemon=True,
-                    )
-                    runtime["thread"] = worker
-                    worker.start()
-                    st.success("Write process started in background.")
-                    st.rerun()
+                normalized_records = dataframe.to_dict(orient="records")
+                worker = threading.Thread(
+                    target=run_database_write_job,
+                    args=(
+                        root,
+                        normalized_records,
+                        runtime,
+                        active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
+                    ),
+                    daemon=True,
+                )
+                runtime["thread"] = worker
+                worker.start()
+                st.success("Write process started in background.")
+                st.rerun()
 
 
 if hasattr(st, "fragment") and str(get_db_write_state().get("status")) in {"running", "cancelling"}:
