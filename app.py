@@ -17,6 +17,8 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
+from timeseries_rows import parse_iso_datetime, split_timeseries_rows_for_write
+
 
 st.set_page_config(layout="wide")
 
@@ -1001,22 +1003,11 @@ def run_database_write_job(
                 append_stream_log(root, "Cleared target tables mydata and futuredata.", runtime=runtime)
 
             updated_to_time = datetime.now() - timedelta(hours=24)
-            past_rows: list[tuple[str, str, str, str]] = []
-            future_rows: list[tuple[str, str, str, str]] = []
-            for row in normalized_rows:
-                date1_dt = parse_iso_datetime(row.get("date1_dt"))
-                if date1_dt is None:
-                    continue
-                payload = (
-                    str(row.get("instr_id", "")),
-                    date1_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    str(row.get("data1", "")),
-                    str(row.get("custom_fields", "")),
-                )
-                if date1_dt < updated_to_time:
-                    past_rows.append(payload)
-                else:
-                    future_rows.append(payload)
+            past_rows, future_rows, duplicates_skipped = split_timeseries_rows_for_write(
+                normalized_rows,
+                updated_to_time,
+                preserve_before_date=preserve_before_date,
+            )
 
             total_rows_to_write = len(past_rows) + len(future_rows)
             update_db_write_state(runtime=runtime, total_rows=total_rows_to_write)
@@ -1026,6 +1017,7 @@ def run_database_write_job(
                 (
                     f"Prepared row groups: past_rows={len(past_rows)}, "
                     f"future_rows={len(future_rows)}, total_rows={total_rows_to_write}, "
+                    f"duplicates_skipped={duplicates_skipped}, "
                     f"preserved_rows={(0 if preserve_before_date is None else 'unchanged_in_place')}, "
                     f"updated_to_time={updated_to_time.strftime('%Y-%m-%d %H:%M:%S')}."
                 ),
@@ -2944,17 +2936,6 @@ def save_timeslice_validation_plots(root: Path, timestamp: str, instruments: lis
 def render_html_plot(path: Path, height: int = 720) -> None:
     if path.exists():
         components.html(path.read_text(encoding="utf-8"), height=height, scrolling=True)
-
-
-def parse_iso_datetime(raw_time: Any) -> datetime | None:
-    if raw_time is None:
-        return None
-    if isinstance(raw_time, datetime):
-        return raw_time
-    try:
-        return datetime.fromisoformat(str(raw_time))
-    except ValueError:
-        return None
 
 
 def format_db_datetime(raw_time: Any) -> str:

@@ -101,11 +101,52 @@ def fetch_single_int(cursor: pymysql.cursors.Cursor, query: str, params: tuple[o
     return int(row[0] or 0)
 
 
+def resolve_row_id_column(cursor: pymysql.cursors.Cursor, table_name: str) -> str | None:
+    cursor.execute(f"SHOW COLUMNS FROM `{table_name}`")
+    columns = list(cursor.fetchall() or [])
+    if not columns:
+        return None
+
+    for column in columns:
+        field_name = str(column[0])
+        key = str(column[3]) if len(column) > 3 else ""
+        extra = str(column[5]).lower() if len(column) > 5 else ""
+        if key == "PRI" or "auto_increment" in extra:
+            return field_name
+
+    field_names = {str(column[0]) for column in columns}
+    if "id" in field_names:
+        return "id"
+    return None
+
+
+def dedupe_timeseries_table(cursor: pymysql.cursors.Cursor, table_name: str) -> int:
+    """Delete exact duplicate business-key rows, keeping the lowest id."""
+    id_column = resolve_row_id_column(cursor, table_name)
+    if id_column is None:
+        return 0
+
+    dedupe_sql = f"""
+        DELETE t1 FROM `{table_name}` t1
+        INNER JOIN `{table_name}` t2
+          ON t1.`instr_id` = t2.`instr_id`
+         AND t1.`date1` = t2.`date1`
+         AND t1.`data1` = t2.`data1`
+         AND COALESCE(t1.`custom_fields`, '') = COALESCE(t2.`custom_fields`, '')
+         AND t1.`{id_column}` > t2.`{id_column}`
+    """
+    cursor.execute(dedupe_sql)
+    return int(cursor.rowcount or 0)
+
+
 def move_rows_to_mydata(connection: pymysql.connections.Connection, updated_to_time: datetime) -> dict[str, int]:
     cutoff_timestamp = updated_to_time.strftime("%Y-%m-%d %H:%M:%S")
 
     with connection.cursor() as cursor:
         cursor.execute("CREATE TABLE IF NOT EXISTS `futuredata` LIKE `mydata`")
+
+        futuredata_duplicates_removed = dedupe_timeseries_table(cursor, "futuredata")
+        mydata_duplicates_removed = dedupe_timeseries_table(cursor, "mydata")
 
         rows_to_update = fetch_single_int(
             cursor,
@@ -119,11 +160,13 @@ def move_rows_to_mydata(connection: pymysql.connections.Connection, updated_to_t
                 "rows_inserted": 0,
                 "rows_deleted": 0,
                 "rows_missing_after_copy": 0,
+                "futuredata_duplicates_removed": futuredata_duplicates_removed,
+                "mydata_duplicates_removed": mydata_duplicates_removed,
             }
 
         insert_sql = f"""
             INSERT INTO `mydata` (`instr_id`, `date1`, `data1`, `custom_fields`)
-            SELECT f.`instr_id`, f.`date1`, f.`data1`, f.`custom_fields`
+            SELECT DISTINCT f.`instr_id`, f.`date1`, f.`data1`, f.`custom_fields`
             FROM `futuredata` f
             LEFT JOIN `mydata` m
               ON {ROW_MATCH_CONDITION}
@@ -135,11 +178,17 @@ def move_rows_to_mydata(connection: pymysql.connections.Connection, updated_to_t
 
         missing_after_copy_sql = f"""
             SELECT COUNT(*)
-            FROM `futuredata` f
+            FROM (
+                SELECT DISTINCT f.`instr_id`, f.`date1`, f.`data1`, f.`custom_fields`
+                FROM `futuredata` f
+                WHERE f.`date1` <= %s
+            ) f
             LEFT JOIN `mydata` m
-              ON {ROW_MATCH_CONDITION}
-            WHERE f.`date1` <= %s
-              AND m.`instr_id` IS NULL
+              ON m.`instr_id` = f.`instr_id`
+             AND m.`date1` = f.`date1`
+             AND m.`data1` = f.`data1`
+             AND COALESCE(m.`custom_fields`, '') = COALESCE(f.`custom_fields`, '')
+            WHERE m.`instr_id` IS NULL
         """
         rows_missing_after_copy = fetch_single_int(cursor, missing_after_copy_sql, (cutoff_timestamp,))
         if rows_missing_after_copy != 0:
@@ -162,6 +211,8 @@ def move_rows_to_mydata(connection: pymysql.connections.Connection, updated_to_t
         "rows_inserted": rows_inserted,
         "rows_deleted": rows_deleted,
         "rows_missing_after_copy": 0,
+        "futuredata_duplicates_removed": futuredata_duplicates_removed,
+        "mydata_duplicates_removed": mydata_duplicates_removed,
     }
 
 
@@ -191,7 +242,9 @@ def main() -> int:
                 f"rows_to_update={results['rows_to_update']}, "
                 f"rows_inserted={results['rows_inserted']}, "
                 f"rows_deleted={results['rows_deleted']}, "
-                f"rows_missing_after_copy={results['rows_missing_after_copy']}."
+                f"rows_missing_after_copy={results['rows_missing_after_copy']}, "
+                f"futuredata_duplicates_removed={results['futuredata_duplicates_removed']}, "
+                f"mydata_duplicates_removed={results['mydata_duplicates_removed']}."
             ),
         )
         return 0
