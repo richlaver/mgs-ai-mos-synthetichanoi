@@ -569,6 +569,14 @@ def selected_start_date(default_start_date: date) -> date:
     return default_start_date
 
 
+def snapshot_overwrite_required(start_mode: str, start_date: date, latest_existing_date: date | None) -> bool:
+    return (
+        start_mode == TIME_SERIES_START_MODE_SNAPSHOT
+        and latest_existing_date is not None
+        and start_date <= latest_existing_date
+    )
+
+
 def chunked_rows(rows: list[tuple[Any, ...]], chunk_size: int = DB_WRITE_CHUNK_SIZE) -> list[list[tuple[Any, ...]]]:
     return [rows[index : index + chunk_size] for index in range(0, len(rows), chunk_size)]
 
@@ -1003,9 +1011,13 @@ def run_database_write_job(
             updated_to_time = datetime.now() - timedelta(hours=24)
             past_rows: list[tuple[str, str, str, str]] = []
             future_rows: list[tuple[str, str, str, str]] = []
+            skipped_rows_before_preserve_date = 0
             for row in normalized_rows:
                 date1_dt = parse_iso_datetime(row.get("date1_dt"))
                 if date1_dt is None:
+                    continue
+                if preserve_before_date is not None and date1_dt.date() < preserve_before_date:
+                    skipped_rows_before_preserve_date += 1
                     continue
                 payload = (
                     str(row.get("instr_id", "")),
@@ -1027,6 +1039,7 @@ def run_database_write_job(
                     f"Prepared row groups: past_rows={len(past_rows)}, "
                     f"future_rows={len(future_rows)}, total_rows={total_rows_to_write}, "
                     f"preserved_rows={(0 if preserve_before_date is None else 'unchanged_in_place')}, "
+                    f"skipped_rows_before_preserve_date={skipped_rows_before_preserve_date}, "
                     f"updated_to_time={updated_to_time.strftime('%Y-%m-%d %H:%M:%S')}."
                 ),
                 runtime=runtime,
@@ -3324,6 +3337,7 @@ if "assimilate_log_state" not in st.session_state:
 root = Path(__file__).resolve().parent
 snapshot_min_date, snapshot_max_date, snapshot_bounds_error = fetch_synthetic_data_date_bounds(root)
 snapshot_available = snapshot_min_date is not None and snapshot_max_date is not None
+snapshot_extension_date = snapshot_max_date + timedelta(days=1) if snapshot_available else None
 default_start_date = six_months_before(date.today())
 
 with st.form("extract_form"):
@@ -3363,17 +3377,33 @@ elif not snapshot_available:
     st.caption("Snapshot of existing synthetic data is unavailable because mydata and futuredata do not contain any rows.")
 
 if start_mode == TIME_SERIES_START_MODE_SNAPSHOT and snapshot_available:
-    snapshot_default_date = st.session_state.get("snapshot_start_date", snapshot_min_date)
+    snapshot_default_date = st.session_state.get("snapshot_start_date")
     if not isinstance(snapshot_default_date, date):
-        snapshot_default_date = snapshot_min_date
-    snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_max_date)
+        snapshot_default_date = snapshot_extension_date
+    snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_extension_date)
     start_date = st.date_input(
         "Start date",
         value=snapshot_default_date,
         min_value=snapshot_min_date,
-        max_value=snapshot_max_date,
+        max_value=snapshot_extension_date,
         key="snapshot_start_date",
+        help="Defaults to the day after the latest existing synthetic reading so only new data is appended. An earlier date deletes and regenerates existing data from that date onward.",
     )
+    if start_date <= snapshot_max_date:
+        st.warning(
+            f"Start date {start_date.isoformat()} is on or before the latest existing reading "
+            f"({snapshot_max_date.isoformat()}). Writing will delete existing synthetic rows in "
+            f"mydata and futuredata from {start_date.isoformat()} onward and replace them with "
+            "regenerated data."
+        )
+        st.checkbox(
+            "Overwrite existing synthetic data from this start date",
+            key="confirm_snapshot_overwrite",
+        )
+    else:
+        st.caption(
+            f"Extending existing synthetic data, which currently ends on {snapshot_max_date.isoformat()}."
+        )
 else:
     zero_default_date = st.session_state.get("zero_start_date", default_start_date)
     if not isinstance(zero_default_date, date):
@@ -4038,69 +4068,79 @@ def render_write_to_database_form() -> None:
         else:
             active_start_mode = selected_start_mode()
             active_start_date = selected_start_date(default_start_date)
-            final_end_date = date.today() if use_today else end_date
-            events_for_write: list[Event] = st.session_state.get("events", [])
-
-            append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
-            dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
-                root,
-                active_start_date,
-                final_end_date,
-                events_for_write,
-                start_mode=active_start_mode,
-                runtime=runtime,
-            )
-
-            if was_reassimilated and rebuilt_instruments:
-                st.session_state["instruments"] = rebuilt_instruments
-            if rebuilt_events:
-                st.session_state["events"] = rebuilt_events
-
-            if dataframe.empty:
-                append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
-                update_db_write_state(
-                    runtime=runtime,
-                    status="error",
-                    async_status="error",
-                    rows_written=0,
-                    total_rows=0,
-                    percent_complete=0.0,
-                    message=source_message,
-                    started=True,
+            if snapshot_overwrite_required(active_start_mode, active_start_date, snapshot_max_date) and not bool(
+                st.session_state.get("confirm_snapshot_overwrite")
+            ):
+                rejection_message = (
+                    f"Write request rejected: snapshot start date {active_start_date.isoformat()} would "
+                    "overwrite existing synthetic data and overwrite was not confirmed."
                 )
-                st.error(source_message)
+                append_stream_log(root, rejection_message, runtime=runtime)
+                st.error(rejection_message)
             else:
-                runtime["cancel_event"].clear()
-                update_db_write_state(
-                    runtime=runtime,
-                    status="running",
-                    async_status="starting",
-                    rows_written=0,
-                    total_rows=int(len(dataframe)),
-                    percent_complete=0.0,
-                    message=source_message,
-                    started=True,
-                    thread_alive=True,
-                    thread_completed_at="",
-                    thread_terminal_message="",
-                )
-                append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
+                final_end_date = date.today() if use_today else end_date
+                events_for_write: list[Event] = st.session_state.get("events", [])
 
-                normalized_records = dataframe.to_dict(orient="records")
-                worker = threading.Thread(
-                    target=run_database_write_job,
-                    args=(
-                        root,
-                        normalized_records,
-                        runtime,
-                        active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
-                    ),
-                    daemon=True,
+                append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
+                dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
+                    root,
+                    active_start_date,
+                    final_end_date,
+                    events_for_write,
+                    start_mode=active_start_mode,
+                    runtime=runtime,
                 )
-                runtime["thread"] = worker
-                worker.start()
-                st.success("Write process started in background.")
-                st.rerun()
+
+                if was_reassimilated and rebuilt_instruments:
+                    st.session_state["instruments"] = rebuilt_instruments
+                if rebuilt_events:
+                    st.session_state["events"] = rebuilt_events
+
+                if dataframe.empty:
+                    append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
+                    update_db_write_state(
+                        runtime=runtime,
+                        status="error",
+                        async_status="error",
+                        rows_written=0,
+                        total_rows=0,
+                        percent_complete=0.0,
+                        message=source_message,
+                        started=True,
+                    )
+                    st.error(source_message)
+                else:
+                    runtime["cancel_event"].clear()
+                    update_db_write_state(
+                        runtime=runtime,
+                        status="running",
+                        async_status="starting",
+                        rows_written=0,
+                        total_rows=int(len(dataframe)),
+                        percent_complete=0.0,
+                        message=source_message,
+                        started=True,
+                        thread_alive=True,
+                        thread_completed_at="",
+                        thread_terminal_message="",
+                    )
+                    append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
+
+                    normalized_records = dataframe.to_dict(orient="records")
+                    worker = threading.Thread(
+                        target=run_database_write_job,
+                        args=(
+                            root,
+                            normalized_records,
+                            runtime,
+                            active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
+                        ),
+                        daemon=True,
+                    )
+                    runtime["thread"] = worker
+                    worker.start()
+                    st.success("Write process started in background.")
+                    st.rerun()
 
 
 if hasattr(st, "fragment") and str(get_db_write_state().get("status")) in {"running", "cancelling"}:
