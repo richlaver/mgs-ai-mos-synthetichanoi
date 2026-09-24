@@ -569,6 +569,14 @@ def selected_start_date(default_start_date: date) -> date:
     return default_start_date
 
 
+def snapshot_overwrite_required(start_mode: str, start_date: date, latest_existing_date: date | None) -> bool:
+    return (
+        start_mode == TIME_SERIES_START_MODE_SNAPSHOT
+        and latest_existing_date is not None
+        and start_date <= latest_existing_date
+    )
+
+
 def chunked_rows(rows: list[tuple[Any, ...]], chunk_size: int = DB_WRITE_CHUNK_SIZE) -> list[list[tuple[Any, ...]]]:
     return [rows[index : index + chunk_size] for index in range(0, len(rows), chunk_size)]
 
@@ -938,6 +946,7 @@ def run_database_write_job(
     normalized_rows: list[dict[str, Any]],
     runtime: dict[str, Any],
     preserve_before_date: date | None = None,
+    overwrite_confirmed: bool = False,
 ) -> None:
     cancel_event: threading.Event = runtime["cancel_event"]
     source_connection = None
@@ -977,35 +986,16 @@ def run_database_write_job(
             target_cursor.execute("CREATE TABLE IF NOT EXISTS `futuredata` LIKE `mydata`")
             target_connection.commit()
             append_stream_log(root, "Ensured target table futuredata exists with the mydata schema.", runtime=runtime)
-            if preserve_before_date is not None:
-                delete_target_rows_from_date(
-                    target_cursor,
-                    target_connection,
-                    "mydata",
-                    preserve_before_date,
-                    root,
-                    runtime,
-                )
-                delete_target_rows_from_date(
-                    target_cursor,
-                    target_connection,
-                    "futuredata",
-                    preserve_before_date,
-                    root,
-                    runtime,
-                )
-            else:
-                target_cursor.execute("DELETE FROM `mydata`")
-                target_cursor.execute("DELETE FROM `futuredata`")
-                target_connection.commit()
-                append_stream_log(root, "Cleared target tables mydata and futuredata.", runtime=runtime)
-
             updated_to_time = datetime.now() - timedelta(hours=24)
             past_rows: list[tuple[str, str, str, str]] = []
             future_rows: list[tuple[str, str, str, str]] = []
+            skipped_rows_before_preserve_date = 0
             for row in normalized_rows:
                 date1_dt = parse_iso_datetime(row.get("date1_dt"))
                 if date1_dt is None:
+                    continue
+                if preserve_before_date is not None and date1_dt.date() < preserve_before_date:
+                    skipped_rows_before_preserve_date += 1
                     continue
                 payload = (
                     str(row.get("instr_id", "")),
@@ -1027,10 +1017,83 @@ def run_database_write_job(
                     f"Prepared row groups: past_rows={len(past_rows)}, "
                     f"future_rows={len(future_rows)}, total_rows={total_rows_to_write}, "
                     f"preserved_rows={(0 if preserve_before_date is None else 'unchanged_in_place')}, "
+                    f"skipped_rows_before_preserve_date={skipped_rows_before_preserve_date}, "
                     f"updated_to_time={updated_to_time.strftime('%Y-%m-%d %H:%M:%S')}."
                 ),
                 runtime=runtime,
             )
+
+            if total_rows_to_write == 0:
+                abort_message = (
+                    "Write aborted: no rows to write for the requested window "
+                    f"(skipped_rows_before_preserve_date={skipped_rows_before_preserve_date})."
+                )
+                append_stream_log(root, abort_message, runtime=runtime)
+                update_db_write_state(
+                    runtime=runtime,
+                    status="error",
+                    async_status="error",
+                    rows_written=0,
+                    total_rows=0,
+                    percent_complete=0.0,
+                    message=abort_message,
+                )
+                return
+
+            if preserve_before_date is not None:
+                table_names = get_existing_synthetic_data_tables(target_cursor)
+                latest_existing_date = None
+                if table_names:
+                    union_query = build_synthetic_data_union_query(table_names)
+                    target_cursor.execute(
+                        f"SELECT MAX(`date1`) FROM ({union_query}) synthetic_data"
+                    )
+                    bounds_row = target_cursor.fetchone()
+                    latest_existing_dt = parse_iso_datetime(bounds_row[0] if bounds_row else None)
+                    if latest_existing_dt is not None:
+                        latest_existing_date = latest_existing_dt.date()
+                if (
+                    latest_existing_date is not None
+                    and preserve_before_date <= latest_existing_date
+                    and not overwrite_confirmed
+                ):
+                    abort_message = (
+                        f"Write aborted: existing synthetic data now ends on {latest_existing_date.isoformat()} "
+                        f"which is on or after start date {preserve_before_date.isoformat()}; "
+                        "overwrite was not confirmed."
+                    )
+                    append_stream_log(root, abort_message, runtime=runtime)
+                    update_db_write_state(
+                        runtime=runtime,
+                        status="error",
+                        async_status="error",
+                        rows_written=0,
+                        total_rows=0,
+                        percent_complete=0.0,
+                        message=abort_message,
+                    )
+                    return
+                delete_target_rows_from_date(
+                    target_cursor,
+                    target_connection,
+                    "mydata",
+                    preserve_before_date,
+                    root,
+                    runtime,
+                )
+                delete_target_rows_from_date(
+                    target_cursor,
+                    target_connection,
+                    "futuredata",
+                    preserve_before_date,
+                    root,
+                    runtime,
+                )
+            else:
+                target_cursor.execute("DELETE FROM `mydata`")
+                target_cursor.execute("DELETE FROM `futuredata`")
+                target_connection.commit()
+                append_stream_log(root, "Cleared target tables mydata and futuredata.", runtime=runtime)
 
             written_rows = 0
             past_batches = chunked_rows(past_rows, DB_WRITE_CHUNK_SIZE)
@@ -3324,6 +3387,7 @@ if "assimilate_log_state" not in st.session_state:
 root = Path(__file__).resolve().parent
 snapshot_min_date, snapshot_max_date, snapshot_bounds_error = fetch_synthetic_data_date_bounds(root)
 snapshot_available = snapshot_min_date is not None and snapshot_max_date is not None
+snapshot_extension_date = snapshot_max_date + timedelta(days=1) if snapshot_available else None
 default_start_date = six_months_before(date.today())
 
 with st.form("extract_form"):
@@ -3363,17 +3427,33 @@ elif not snapshot_available:
     st.caption("Snapshot of existing synthetic data is unavailable because mydata and futuredata do not contain any rows.")
 
 if start_mode == TIME_SERIES_START_MODE_SNAPSHOT and snapshot_available:
-    snapshot_default_date = st.session_state.get("snapshot_start_date", snapshot_min_date)
+    snapshot_default_date = st.session_state.get("snapshot_start_date")
     if not isinstance(snapshot_default_date, date):
-        snapshot_default_date = snapshot_min_date
-    snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_max_date)
+        snapshot_default_date = snapshot_extension_date
+    snapshot_default_date = min(max(snapshot_default_date, snapshot_min_date), snapshot_extension_date)
     start_date = st.date_input(
         "Start date",
         value=snapshot_default_date,
         min_value=snapshot_min_date,
-        max_value=snapshot_max_date,
+        max_value=snapshot_extension_date,
         key="snapshot_start_date",
+        help="Defaults to the day after the latest existing synthetic reading so only new data is appended. An earlier date deletes and regenerates existing data from that date onward.",
     )
+    if start_date <= snapshot_max_date:
+        st.warning(
+            f"Start date {start_date.isoformat()} is on or before the latest existing reading "
+            f"({snapshot_max_date.isoformat()}). Writing will delete existing synthetic rows in "
+            f"mydata and futuredata from {start_date.isoformat()} onward and replace them with "
+            "regenerated data."
+        )
+        st.checkbox(
+            "Overwrite existing synthetic data from this start date",
+            key="confirm_snapshot_overwrite",
+        )
+    else:
+        st.caption(
+            f"Extending existing synthetic data, which currently ends on {snapshot_max_date.isoformat()}."
+        )
 else:
     zero_default_date = st.session_state.get("zero_start_date", default_start_date)
     if not isinstance(zero_default_date, date):
@@ -3392,6 +3472,12 @@ end_date = st.date_input(
     label_visibility="collapsed",
     key="selected_end_date",
 )
+resolved_end_date = date.today() if use_today else end_date
+if start_date > resolved_end_date:
+    st.error(
+        f"Start date {start_date.isoformat()} is after end date {resolved_end_date.isoformat()}; "
+        "untick Today or choose an end date on or after the start date."
+    )
 with st.form("generate_event_history_form"):
     st.subheader("Generate event history")
     generate_current_state = get_form_log_state_snapshot("generate_log_state")
@@ -3400,8 +3486,14 @@ with st.form("generate_event_history_form"):
     render_form_progress_widgets(generate_progress_bar, generate_progress_caption, generate_current_state)
     generate_clicked = st.form_submit_button("Generate")
 
-    if generate_clicked:
-        final_end_date = date.today() if use_today else end_date
+    if generate_clicked and start_date > resolved_end_date:
+        rejection_message = (
+            f"Generate rejected: start date {start_date.isoformat()} is after end date {resolved_end_date.isoformat()}."
+        )
+        append_form_log(root, "generate_stream.log", "generate_log_state", rejection_message)
+        st.error(rejection_message)
+    if generate_clicked and start_date <= resolved_end_date:
+        final_end_date = resolved_end_date
         total_generation_days = max(0, (final_end_date - start_date).days + 1)
         total_progress_units = total_generation_days + 6
         completed_units = 0
@@ -3558,7 +3650,15 @@ with st.form("synthesise_time_series_form"):
     render_form_progress_widgets(synthesise_progress_bar, synthesise_progress_caption, synthesise_current_state)
     synthesise_clicked = st.form_submit_button("Synthesise")
 
-    if synthesise_clicked:
+    synthesise_active_start_date = selected_start_date(default_start_date)
+    if synthesise_clicked and synthesise_active_start_date > resolved_end_date:
+        rejection_message = (
+            f"Synthesise rejected: start date {synthesise_active_start_date.isoformat()} "
+            f"is after end date {resolved_end_date.isoformat()}."
+        )
+        append_form_log(root, "synthesise_stream.log", "synthesise_log_state", rejection_message)
+        st.error(rejection_message)
+    if synthesise_clicked and synthesise_active_start_date <= resolved_end_date:
         completed_units = 0
         total_progress_units = 1
         current_state = set_form_progress(
@@ -3875,11 +3975,18 @@ with st.form("assimilate_database_fields_form"):
     render_form_progress_widgets(assimilate_progress_bar, assimilate_progress_caption, assimilate_current_state)
     assimilate_clicked = st.form_submit_button("Assimilate")
 
-    if assimilate_clicked:
+    if assimilate_clicked and selected_start_date(default_start_date) > resolved_end_date:
+        rejection_message = (
+            f"Assimilate rejected: start date {selected_start_date(default_start_date).isoformat()} "
+            f"is after end date {resolved_end_date.isoformat()}."
+        )
+        append_form_log(root, "assimilate_stream.log", "assimilate_log_state", rejection_message)
+        st.error(rejection_message)
+    if assimilate_clicked and selected_start_date(default_start_date) <= resolved_end_date:
         active_start_mode = selected_start_mode()
         active_start_date = selected_start_date(default_start_date)
         events: list[Event] = st.session_state.get("events", [])
-        final_end_date = date.today() if use_today else end_date
+        final_end_date = resolved_end_date
 
         current_state = set_form_progress(
             "assimilate_log_state",
@@ -4039,68 +4146,86 @@ def render_write_to_database_form() -> None:
             active_start_mode = selected_start_mode()
             active_start_date = selected_start_date(default_start_date)
             final_end_date = date.today() if use_today else end_date
-            events_for_write: list[Event] = st.session_state.get("events", [])
-
-            append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
-            dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
-                root,
-                active_start_date,
-                final_end_date,
-                events_for_write,
-                start_mode=active_start_mode,
-                runtime=runtime,
-            )
-
-            if was_reassimilated and rebuilt_instruments:
-                st.session_state["instruments"] = rebuilt_instruments
-            if rebuilt_events:
-                st.session_state["events"] = rebuilt_events
-
-            if dataframe.empty:
-                append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
-                update_db_write_state(
-                    runtime=runtime,
-                    status="error",
-                    async_status="error",
-                    rows_written=0,
-                    total_rows=0,
-                    percent_complete=0.0,
-                    message=source_message,
-                    started=True,
+            if snapshot_overwrite_required(active_start_mode, active_start_date, snapshot_max_date) and not bool(
+                st.session_state.get("confirm_snapshot_overwrite")
+            ):
+                rejection_message = (
+                    f"Write request rejected: snapshot start date {active_start_date.isoformat()} would "
+                    "overwrite existing synthetic data and overwrite was not confirmed."
                 )
-                st.error(source_message)
+                append_stream_log(root, rejection_message, runtime=runtime)
+                st.error(rejection_message)
+            elif active_start_date > final_end_date:
+                rejection_message = (
+                    f"Write rejected: start date {active_start_date.isoformat()} is after end date "
+                    f"{final_end_date.isoformat()}."
+                )
+                append_stream_log(root, rejection_message, runtime=runtime)
+                st.error(rejection_message)
             else:
-                runtime["cancel_event"].clear()
-                update_db_write_state(
-                    runtime=runtime,
-                    status="running",
-                    async_status="starting",
-                    rows_written=0,
-                    total_rows=int(len(dataframe)),
-                    percent_complete=0.0,
-                    message=source_message,
-                    started=True,
-                    thread_alive=True,
-                    thread_completed_at="",
-                    thread_terminal_message="",
-                )
-                append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
+                events_for_write: list[Event] = st.session_state.get("events", [])
 
-                normalized_records = dataframe.to_dict(orient="records")
-                worker = threading.Thread(
-                    target=run_database_write_job,
-                    args=(
-                        root,
-                        normalized_records,
-                        runtime,
-                        active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
-                    ),
-                    daemon=True,
+                append_stream_log(root, "Beginning pre-write data preparation.", runtime=runtime)
+                dataframe, was_reassimilated, source_message, rebuilt_instruments, rebuilt_events = prepare_mydata_for_write(
+                    root,
+                    active_start_date,
+                    final_end_date,
+                    events_for_write,
+                    start_mode=active_start_mode,
+                    runtime=runtime,
                 )
-                runtime["thread"] = worker
-                worker.start()
-                st.success("Write process started in background.")
-                st.rerun()
+
+                if was_reassimilated and rebuilt_instruments:
+                    st.session_state["instruments"] = rebuilt_instruments
+                if rebuilt_events:
+                    st.session_state["events"] = rebuilt_events
+
+                if dataframe.empty:
+                    append_stream_log(root, "Write request aborted: prepared dataframe is empty.", runtime=runtime)
+                    update_db_write_state(
+                        runtime=runtime,
+                        status="error",
+                        async_status="error",
+                        rows_written=0,
+                        total_rows=0,
+                        percent_complete=0.0,
+                        message=source_message,
+                        started=True,
+                    )
+                    st.error(source_message)
+                else:
+                    runtime["cancel_event"].clear()
+                    update_db_write_state(
+                        runtime=runtime,
+                        status="running",
+                        async_status="starting",
+                        rows_written=0,
+                        total_rows=int(len(dataframe)),
+                        percent_complete=0.0,
+                        message=source_message,
+                        started=True,
+                        thread_alive=True,
+                        thread_completed_at="",
+                        thread_terminal_message="",
+                    )
+                    append_stream_log(root, f"Prepared {len(dataframe)} rows. Spawning background write thread.", runtime=runtime)
+
+                    normalized_records = dataframe.to_dict(orient="records")
+                    worker = threading.Thread(
+                        target=run_database_write_job,
+                        args=(
+                            root,
+                            normalized_records,
+                            runtime,
+                            active_start_date if active_start_mode == TIME_SERIES_START_MODE_SNAPSHOT else None,
+                            bool(st.session_state.get("confirm_snapshot_overwrite")),
+                        ),
+                        daemon=True,
+                    )
+                    runtime["thread"] = worker
+                    worker.start()
+                    st.success("Write process started in background.")
+                    st.rerun()
 
 
 if hasattr(st, "fragment") and str(get_db_write_state().get("status")) in {"running", "cancelling"}:
